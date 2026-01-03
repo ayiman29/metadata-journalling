@@ -288,7 +288,7 @@ static void cmd_create(const char *image_path, const char *filename) {
     uint32_t total_needed = (num_data_records * record_size) + commit_size;
 
     if (current_offset + total_needed > JOURNAL_SIZE) {
-        fprintf(stderr, "Error: insufficient journal space. Please run './journal install' first.\n");
+        fprintf(stderr, "Error: insufficient journal space. Install journal!\n");
         free(journal_buf);
         close(fd);
         exit(EXIT_FAILURE);
@@ -307,8 +307,7 @@ static void cmd_create(const char *image_path, const char *filename) {
     free(journal_buf);
     close(fd);
 
-    printf("Created file '%s' in journal (not yet applied to filesystem).\n", filename);
-    printf("Run './journal install' to apply changes.\n");
+    printf("Created file '%s'\n", filename);
 }
 
 static void cmd_install(const char *image_path) {
@@ -379,8 +378,7 @@ static void cmd_install(const char *image_path) {
     free(journal_buf);
     close(fd);
 
-    printf("Replayed %d transaction(s) and cleared journal.\n", transactions_replayed);
-    printf("Filesystem metadata has been updated.\n");
+    printf("Installed %d transaction(s) and cleared journal.\n", transactions_replayed);
 }
 
 int main(int argc, char *argv[]) {
