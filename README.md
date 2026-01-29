@@ -697,24 +697,3 @@ else if (strcmp(command, "install") == 0)
 ```
 
 Calls `cmd_install`.
-
----
-
-# 16. Big-picture summary
-
-This program demonstrates:
-
-* **Write-ahead logging**
-* **Crash-safe metadata updates**
-* **Atomic filesystem transactions**
-* **Copy-on-write journaling**
-
-It mirrors how **EXT3 / EXT4 journaling** works conceptually.
-
-If you want, I can next:
-
-* Walk through a **full execution trace**
-* Explain **crash scenarios**
-* Diagram the **on-disk layout**
-* Compare this with **EXT2 vs EXT3**
-  Just tell me.
