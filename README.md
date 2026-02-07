@@ -1,699 +1,178 @@
-# 1. Header files
-
-```c
-#include <errno.h>
-#include <fcntl.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-#include <unistd.h>
-```
-
-These are standard C / POSIX headers:
-
-* `<errno.h>` – error codes set by system calls
-* `<fcntl.h>` – file control flags (`open`, `O_RDWR`, etc.)
-* `<stdint.h>` – fixed-width integer types (`uint32_t`, etc.)
-* `<stdio.h>` – I/O (`printf`, `perror`)
-* `<stdlib.h>` – memory & process control (`malloc`, `exit`)
-* `<string.h>` – memory/string utilities (`memcpy`, `strcmp`)
-* `<time.h>` – timestamps (`time`)
-* `<unistd.h>` – POSIX system calls (`read`, `write`, `lseek`, `close`)
-
----
-
-# 2. Magic numbers
-
-```c
-#define FS_MAGIC 0x56534653U
-#define JOURNAL_MAGIC 0x4A524E4CU
-```
-
-* `FS_MAGIC` identifies a **valid filesystem**
-* `JOURNAL_MAGIC` identifies a **valid journal**
-
-These are written into on-disk structures to detect corruption or wrong files.
-
----
-
-# 3. Filesystem layout constants
-
-```c
-#define BLOCK_SIZE        4096U
-#define INODE_SIZE         128U
-```
-
-* Each disk block = **4096 bytes**
-* Each inode = **128 bytes**
-
----
-
-```c
-#define JOURNAL_BLOCK_IDX    1U
-#define JOURNAL_BLOCKS      16U
-```
-
-* Journal starts at **block 1**
-* Journal spans **16 blocks**
-
----
-
-```c
-#define INODE_BLOCKS         2U
-#define DATA_BLOCKS         64U
-```
-
-* 2 blocks of inodes
-* 64 blocks of file data
-
----
-
-```c
-#define INODE_BMAP_IDX     (JOURNAL_BLOCK_IDX + JOURNAL_BLOCKS)
-#define DATA_BMAP_IDX      (INODE_BMAP_IDX + 1U)
-#define INODE_START_IDX    (DATA_BMAP_IDX + 1U)
-#define DATA_START_IDX     (INODE_START_IDX + INODE_BLOCKS)
-#define TOTAL_BLOCKS       (DATA_START_IDX + DATA_BLOCKS)
-```
-
-This defines the **exact disk layout**:
-
-| Block | Purpose      |
-| ----- | ------------ |
-| 0     | Superblock   |
-| 1–16  | Journal      |
-| 17    | Inode bitmap |
-| 18    | Data bitmap  |
-| 19–20 | Inode table  |
-| 21–84 | Data blocks  |
-
----
-
-```c
-#define DIRECT_POINTERS     8U
-#define NAME_LEN           28
-#define DEFAULT_IMAGE "vsfs.img"
-```
-
-* Each inode has **8 direct data pointers**
-* Directory entry names max **28 bytes**
-* Default disk image name
-
----
-
-# 4. Journal constants
-
-```c
-#define JOURNAL_SIZE (JOURNAL_BLOCKS * BLOCK_SIZE)
-```
-
-Total journal size in bytes.
-
----
-
-```c
-#define REC_DATA   1
-#define REC_COMMIT 2
-```
-
-Journal record types:
-
-* `REC_DATA` → block write
-* `REC_COMMIT` → transaction boundary
-
----
-
-# 5. Inode types
-
-```c
-#define INODE_FREE 0
-#define INODE_FILE 1
-#define INODE_DIR  2
-```
-
-Defines what an inode represents.
-
----
-
-# 6. On-disk data structures
-
----
-
-## Superblock
-
-```c
-struct superblock {
-```
-
-Holds global filesystem metadata.
-
-```c
-    uint32_t magic;
-```
-
-Filesystem magic number.
-
-```c
-    uint32_t block_size;
-    uint32_t total_blocks;
-    uint32_t inode_count;
-```
-
-Basic geometry of the filesystem.
-
-```c
-    uint32_t journal_block;
-    uint32_t inode_bitmap;
-    uint32_t data_bitmap;
-    uint32_t inode_start;
-    uint32_t data_start;
-```
-
-Block indices for important regions.
-
-```c
-    uint8_t  _pad[128 - 9 * 4];
-};
-```
-
-Padding to make the structure **exactly 128 bytes**.
-
----
-
-## Inode
-
-```c
-struct inode {
-```
-
-Represents a file or directory.
-
-```c
-    uint16_t type;
-    uint16_t links;
-```
-
-* Type: file/dir/free
-* Hard link count
-
-```c
-    uint32_t size;
-```
-
-File size in bytes.
-
-```c
-    uint32_t direct[DIRECT_POINTERS];
-```
-
-Direct data block pointers.
-
-```c
-    uint32_t ctime;
-    uint32_t mtime;
-```
-
-Creation and modification times.
-
-```c
-    uint8_t _pad[128 - (...)]
-};
-```
-
-Padding to 128 bytes.
-
----
-
-## Directory entry
-
-```c
-struct dirent {
-    uint32_t inode;
-    char name[NAME_LEN];
-};
-```
-
-Maps filename → inode number.
-
----
-
-## Journal structures
-
-```c
-struct journal_header {
-    uint32_t magic;
-    uint32_t nbytes_used;
-};
-```
-
-* Identifies journal
-* Tracks how much is filled
-
----
-
-```c
-struct rec_header {
-    uint16_t type;
-    uint16_t size;
-};
-```
-
-Header for *any* journal record.
-
----
-
-```c
-struct data_record {
-    struct rec_header hdr;
-    uint32_t block_no;
-    uint8_t data[BLOCK_SIZE];
-};
-```
-
-Logs:
-
-* Which block to write
-* The entire block content
-
----
-
-```c
-struct commit_record {
-    struct rec_header hdr;
-};
-```
-
-Marks end of a transaction.
-
----
-
-# 7. Error helper
-
-```c
-static void die(const char *msg) {
-    perror(msg);
-    exit(EXIT_FAILURE);
-}
-```
-
-* Prints error with `errno`
-* Terminates program
-
----
-
-# 8. Block I/O helpers
-
----
-
-```c
-static void read_block(int fd, uint32_t block_index, void *buf)
-```
-
-Reads one full block.
-
-```c
-off_t offset = (off_t)block_index * BLOCK_SIZE;
-```
-
-Calculate byte offset.
-
-```c
-lseek(fd, offset, SEEK_SET);
-read(fd, buf, BLOCK_SIZE);
-```
-
-Seek + read.
-
----
-
-```c
-static void write_block(...)
-```
-
-Same logic, but writes.
-
----
-
-# 9. Bitmap utilities
-
----
-
-```c
-static int bitmap_test(const uint8_t *bitmap, uint32_t index)
-```
-
-Checks if a bit is set.
-
----
-
-```c
-static void bitmap_set(uint8_t *bitmap, uint32_t index)
-```
-
-Marks a bit as used.
-
----
-
-```c
-static uint32_t bitmap_find_free(...)
-```
-
-Finds first zero bit → free inode/block.
-
-Returns `-1` if none found.
-
----
-
-# 10. Journal read/write
-
----
-
-```c
-static void read_journal(...)
-```
-
-Reads **all 16 journal blocks** into memory.
-
----
-
-```c
-static void write_journal(...)
-```
-
-Writes memory journal back to disk.
-
----
-
-# 11. Journal initialization
-
----
-
-```c
-static void init_journal(uint8_t *journal_buf)
-```
-
-* Clears journal
-* Writes magic number
-* Sets initial offset
-
----
-
-```c
-static int journal_is_initialized(...)
-```
-
-Checks magic number.
-
----
-
-# 12. Journal append helpers
-
----
-
-```c
-append_data_record(...)
-```
-
-Appends:
-
-* Record header
-* Block number
-* Full block contents
-
-Advances offset.
-
----
-
-```c
-append_commit_record(...)
-```
-
-Appends a commit marker.
-
----
-
-```c
-update_journal_header(...)
-```
-
-Updates `nbytes_used`.
-
----
-
-# 13. `cmd_create()` — journaling a file creation
+# Metadata Journalling File System
 
-This **does NOT modify the filesystem directly**.
+A lightweight file system implementation with journal-based crash recovery, designed for CSE321 (Operating Systems). Only part I had to work on is [journal.c](https://github.com/ayiman29/metadata-journalling/blob/main/journal.c)
 
-It logs changes into the journal.
+## Overview
 
----
+This project implements a simple file system with **metadata journalling** to ensure consistency and provide crash recovery. The system uses a write-ahead journal to log all metadata changes before they are applied to the main file system structures.
 
-### Filename validation
+### Key Concepts
 
-```c
-if (strlen(filename) >= NAME_LEN)
-```
-
-Directory entry name limit.
-
----
-
-### Open image
-
-```c
-int fd = open(image_path, O_RDWR);
-```
-
-Read-write disk image.
-
----
-
-### Read superblock
-
-```c
-read_block(fd, 0, &sb);
-```
-
-Block 0 is superblock.
-
-```c
-if (sb.magic != FS_MAGIC)
-```
-
-Reject invalid filesystem.
+**Journalling**: All metadata modifications (file creation, inode updates, bitmap changes) are first written to a journal as atomic transactions. Only after a commit record is written does the system apply these changes to the actual file system. This ensures that the system can recover to a consistent state after a crash.
 
----
+**Crash Consistency**: If the system crashes before a commit, the incomplete transaction in the journal is discarded. If it crashes after a commit, the transactions can be replayed during recovery.
 
-### Load journal
+## Project Structure
 
-```c
-journal_buf = malloc(...)
-read_journal(...)
 ```
-
-Initialize journal if needed.
-
----
-
-### Read metadata
-
-```c
-read_block(fd, INODE_BMAP_IDX, inode_bitmap);
-read_block(fd, DATA_BMAP_IDX, data_bitmap);
-read_block(fd, INODE_START_IDX, inode_block);
-```
-
-Load bitmaps and root inode block.
-
----
-
-### Read root directory
-
-```c
-struct inode *root_inode = ...
-uint32_t root_data_blk = root_inode->direct[0];
-read_block(fd, root_data_blk, root_data_block);
-```
-
-Root directory stored in first data block.
-
----
-
-### Find free inode
-
-```c
-bitmap_find_free(...)
+├── mkfs.c          - Creates a new file system image with journal support
+├── journal.c       - Manages journalling: file creation and transaction installation
+├── validator.c     - Validates and verifies file system consistency
+└── vsfs.img        - File system image (created by mkfs)
 ```
-
-Fail if no inode available.
 
----
+## File System Layout
 
-### Find free directory entry
+The file system is organized into **84 blocks** (4096 bytes each):
 
-```c
-for (...) {
-```
+| Blocks | Purpose |
+|--------|---------|
+| 0 | Superblock (metadata about the file system) |
+| 1-16 | Journal (16 blocks for write-ahead logging) |
+| 17 | Inode Bitmap (tracks which inodes are in use) |
+| 18 | Data Bitmap (tracks which data blocks are in use) |
+| 19-20 | Inode Table (stores file metadata) |
+| 21-84 | Data Blocks (actual file content) |
 
-* Ensure filename doesn’t already exist
-* Find empty slot
+## Superblock Structure
 
----
+Contains essential file system information:
+- Magic number (`0x56534653`) for validation
+- Block size and total block count
+- Inode and data bitmap locations
+- Inode and data block start addresses
 
-### Copy-on-write preparation
-
-```c
-memcpy(new_inode_bitmap, ...)
-memcpy(new_inode_block, ...)
-memcpy(new_root_data_block, ...)
-```
+## Data Structures
 
-IMPORTANT:
-**Never modify original blocks directly** — journaled FS rule.
+### Inode
+Metadata for files/directories:
+- Type (file=1, directory=2, free=0)
+- Link count
+- File size
+- 8 direct block pointers
+- Creation and modification timestamps
 
----
+### Journal Records
 
-### Allocate inode
+**Data Record**: Stores a modified block
+- Record type (REC_DATA = 1)
+- Block number
+- Block data (4096 bytes)
 
-```c
-bitmap_set(new_inode_bitmap, free_inode);
-```
+**Commit Record**: Marks end of transaction
+- Record type (REC_COMMIT = 2)
+- Marks the point where changes become durable
 
----
+### Journal Header
+- Magic number (`0x4A524E4C`) indicates initialized journal
+- Bytes used (current journal size)
 
-### Initialize new inode
+## Building
 
-```c
-new_file_inode->type = INODE_FILE;
-new_file_inode->links = 1;
-new_file_inode->size = 0;
+```bash
+gcc -o mkfs mkfs.c
+gcc -o journal journal.c
+gcc -o validator validator.c
 ```
-
-Empty file.
 
----
+## Usage
 
-### Update directory entry
+### 1. Create a New File System
 
-```c
-new_entries[free_entry].inode = free_inode;
-strncpy(...)
+```bash
+./mkfs
 ```
 
-Adds filename → inode mapping.
+This creates `vsfs.img` with:
+- Initialized superblock
+- Empty journal
+- Root directory inode
+- Bitmap structures
 
----
+### 2. Create Files (with Journalling)
 
-### Update root inode size
-
-```c
-new_root_inode->size += sizeof(struct dirent);
+```bash
+./journal create myfile.txt
 ```
 
-Directory grew.
+This demonstrates the journalling process:
+1. **Log Phase**: Write all modifications (inode bitmap, inode, directory entry) to the journal as data records
+2. **Commit Phase**: Write a commit record marking the transaction as complete
+3. **Consistency**: If crash occurs before commit, transaction is discarded; if after, it can be replayed
 
----
+The file creation logs:
+- Updated inode bitmap
+- New inode metadata
+- Updated root directory entry
 
-### Space check
+### 3. Install Committed Transactions
 
-```c
-if (current_offset + total_needed > JOURNAL_SIZE)
+```bash
+./journal install
 ```
 
-Prevent journal overflow.
+This applies all committed transactions from the journal to the actual file system:
+1. Scans the journal for complete transactions (ending with commit records)
+2. Replays data records to their target blocks
+3. Clears the journal after successful installation
 
----
+**Simulating Recovery**: If you edit `vsfs.img` manually or simulate a crash, running `./journal install` again will apply any pending transactions.
 
-### Append journal records
+### 4. Validate File System Consistency
 
-```c
-append_data_record(... inode bitmap ...)
-append_data_record(... inode block ...)
-append_data_record(... root directory ...)
-append_commit_record(...)
+```bash
+./validator
 ```
-
-Transaction = **3 metadata writes + commit**.
 
----
+Checks:
+- Superblock magic number validity
+- Inode bitmap consistency with actual inodes
+- Data bitmap consistency with allocated data blocks
+- Inode structure validity
+- Root directory integrity
+- Journal state and completeness
 
-### Write journal to disk
+## How Crash Recovery Works
 
-```c
-write_journal(fd, journal_buf);
+### Scenario 1: Crash During Logging
 ```
-
-Filesystem NOT changed yet.
-
----
-
-# 14. `cmd_install()` — replay journal
-
----
-
-### Load journal
-
-```c
-read_journal(...)
-journal_is_initialized(...)
+1. update inode bitmap → write to journal
+2. update inode → write to journal
+3. CRASH (before commit record)
 ```
-
----
-
-### First pass: count commits
+**Recovery**: run `./journal install` → nothing happens (no commit record found)
 
-```c
-while (offset < nbytes_used)
+### Scenario 2: Crash After Commit
 ```
-
-Counts how many transactions exist.
-
----
-
-### Second pass: apply writes
-
-```c
-if (hdr->type == REC_DATA)
-    write_block(fd, data_rec->block_no, data_rec->data);
+1. write inode bitmap to journal
+2. write inode to journal
+3. write commit record to journal
+4. CRASH (before installation)
 ```
-
-Actually modifies disk blocks.
-
----
-
-### Clear journal
+**Recovery**: run `./journal install` → replays all logged blocks to file system
 
-```c
-init_journal(...)
-write_journal(...)
+### Scenario 3: Normal Operation
 ```
-
-Journal is reset.
-
----
-
-# 15. `main()`
-
-```c
-if (argc < 2)
+1. write all changes to journal
+2. write commit record
+3. run install → apply to file system
+4. clear journal
 ```
 
-Requires command.
+## Key Features
 
----
+✅ **Atomic Transactions**: Changes are all-or-nothing  
+✅ **Write-Ahead Logging**: Journal logs changes before applying them  
+✅ **Crash Consistency**: System can recover to consistent state  
+✅ **Bitmap Management**: Tracks free inodes and data blocks  
+✅ **File Creation**: Creates files as atomic transactions  
+✅ **Validation**: Checks file system integrity  
 
-```c
-if (strcmp(command, "create") == 0)
-```
-
-Calls `cmd_create`.
 
----
-
-```c
-else if (strcmp(command, "install") == 0)
-```
+## Concepts Demonstrated
 
-Calls `cmd_install`.
+- **File System Structures**: Superblock, inode, bitmaps, directories
+- **Journalling**: Write-ahead logging, transaction records
+- **Crash Recovery**: Redo logging, atomic operations
+- **Bitmap Operations**: Efficient bit manipulation for space tracking
+- **Disk I/O**: Block-oriented file operations
